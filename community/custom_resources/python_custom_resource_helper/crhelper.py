@@ -151,7 +151,8 @@ def cfn_handler(event, context, create, update, delete):
             physical_resource_id, response_data = execute_handler(event, context, update)
         elif event["RequestType"] == "Delete":
             delete(event, context)
-
+            physical_resource_id = event["PhysicalResourceId"]
+                
         send_cfn(event, context, SUCCESS, response_data, physical_resource_id=physical_resource_id)
 
     # Safety switch - Catch any exceptions, log the stacktrace, send a failure back to
