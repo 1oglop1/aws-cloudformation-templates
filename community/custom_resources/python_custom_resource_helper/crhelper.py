@@ -16,8 +16,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ##################################################################################################
+"""
+This module handles communication with AWS Cloudformation during the
+creation of lambda backed Custom Resource.
 
-from __future__ import print_function
+Adopted from
+https://github.com/awslabs/aws-cloudformation-templates/blob/master/community/custom_resources/python_custom_resource_helper/crhelper.py
+version: https://github.com/awslabs/aws-cloudformation-templates/commit/39432800827b93bda16dfb26c2e300d8a747f6d3
+
+Usage:
+
+In import this module lambda_handler.py, create functions with required output.
+# lambda_handler.py
+
+from crhelper import cfn_handler
+
+def create(event, content):
+   \"""Create resource.\"""
+    physical_resource_id = context.log_stream_name
+    return physical_resource_id, {"Some": "Data"}
+
+def update(event, context)
+    \"""Update resource.\"""
+    physical_resource_id = event['PhysicalResourceId']
+    return physical_resource_id, {}
+
+def delete(event):
+    \"""Delete resource.\"""
+    return event['PhysicalResourceId']
+
+def lambda_handler(event, context):
+    cfn_handler(event, context, create, update, delete)
+
+"""
 
 import json
 import logging
@@ -25,117 +56,143 @@ import threading
 
 from botocore.vendored import requests
 
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(logging.NullHandler())
 
-def log_config(event, loglevel=None, botolevel=None):
-    if 'ResourceProperties' in event.keys():
-        if 'loglevel' in event['ResourceProperties'] and not loglevel:
-            loglevel = event['ResourceProperties']['loglevel']
-        if 'botolevel' in event['ResourceProperties'] and not botolevel:
-            loglevel = event['ResourceProperties']['botolevel']
-    if not loglevel:
-        loglevel = 'WARNING'
-    if not botolevel:
-        botolevel = 'ERROR'
-    # Set log verbosity levels
-    loglevel = getattr(logging, loglevel.upper(), 20)
-    botolevel = getattr(logging, botolevel.upper(), 40)
-    mainlogger = logging.getLogger()
-    mainlogger.setLevel(loglevel)
-    logging.getLogger('boto3').setLevel(botolevel)
-    logging.getLogger('botocore').setLevel(botolevel)
-    # Set log message format
-    logfmt = '[%(requestid)s][%(asctime)s][%(levelname)s] %(message)s \n'
-    mainlogger.handlers[0].setFormatter(logging.Formatter(logfmt))
-    return logging.LoggerAdapter(mainlogger, {'requestid': event['RequestId']})
+SUCCESS = "SUCCESS"
+FAILED = "FAILED"
 
 
-def send(event, context, response_status, response_data, physical_resource_id,
-         logger, reason=None):
-    response_url = event['ResponseURL']
-    logger.debug("CFN response URL: {}".format(response_url))
+def send_cfn(event, context, response_status, response_data, reason=None, physical_resource_id=None):
+    """
+    Send a resource manipulation status response to CloudFormation
 
-    response_body = dict()
-    response_body['Status'] = response_status
-    msg = 'See CloudWatch Log Stream: {}'.format(context.log_stream_name)
-    if not reason:
-        response_body['Reason'] = msg
-    else:
-        response_body['Reason'] = str(reason)[0:255] + ' ({})'.format(msg)
-    response_body['PhysicalResourceId'] = physical_resource_id or 'NONE'
-    response_body['StackId'] = event['StackId']
-    response_body['RequestId'] = event['RequestId']
-    response_body['LogicalResourceId'] = event['LogicalResourceId']
-    if response_data and response_data != {} and response_data != [] and isinstance(response_data, dict):
-        response_body['Data'] = response_data
+    Modified from:
+    https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html
+    """
 
-    json_response_body = json.dumps(response_body)
+    default_reason = (
+        f"See the details in CloudWatch Log group {context.log_group_name} "
+        f"Stream: {context.log_stream_name}"
+    )
 
-    logger.debug("Response body:\n{}".format(json_response_body))
+    response_body = json.dumps(
+        {
+            "Status": response_status,
+            "Reason": str(reason) + f".. {default_reason}" if reason else default_reason,
+            "PhysicalResourceId": physical_resource_id or context.log_stream_name,
+            "StackId": event["StackId"],
+            "RequestId": event["RequestId"],
+            "LogicalResourceId": event["LogicalResourceId"],
+            "Data": response_data,
+        }
+    )
 
-    headers = {
-        'content-type': '',
-        'content-length': str(len(json_response_body))
-    }
+    LOGGER.info(f"ResponseURL: {event['ResponseURL']}", )
+    LOGGER.info(f"ResponseBody: {response_body}")
+
+    headers = {"Content-Type": "", "Content-Length": str(len(response_body))}
+
+    response = requests.put(event["ResponseURL"], data=response_body, headers=headers)
 
     try:
-        response = requests.put(response_url,
-                                data=json_response_body,
-                                headers=headers)
-        logger.info("CloudFormation returned status code: {}".format(response.reason))
-    except Exception as e:
-        logger.error("send(..) failed executing requests.put(..): {}".format(e))
+        response.raise_for_status()
+        LOGGER.info(f"Status code: {response.reason}")
+    except requests.HTTPError:
+        LOGGER.exception(f"Failed to send CFN response. {response.text}")
         raise
 
 
-# Function that executes just before lambda execution times out
-def timeout(event, context, logger):
-    logger.error("Execution is about to time out, sending failure message")
-    send(event, context, "FAILED", {}, None, reason="Execution timed out",
-         logger=logger)
+def lambda_timeout(event, context):
+    """Send error to CFN if Lambda runs ouf of time."""
+    msg = "Execution is about to time out, sending failure message"
+    LOGGER.error(msg)
+    send_cfn(event, context, FAILED, {}, reason=msg)
+    raise Exception(msg)
 
 
-# Handler function
-def cfn_handler(event, context, create, update, delete, logger, init_failed):
-    logger.info("Lambda RequestId: {} CloudFormation RequestId: {}".format(context.aws_request_id, event['RequestId']))
+def cfn_handler(event, context, create, update, delete):
+    """
+    Handle CFN events.
 
-    # Define an object to place any response information you would like to send
-    # back to CloudFormation (these keys can then be used by Fn::GetAttr)
-    response_data = {}
+    This function executes methods for custom resource creation and send response to cloudformation API.
 
-    # Define a physical_id for the resource, if the event is an update and the
-    # returned physical_id changes, cloudformation will then issue a delete
-    # against the old id
+    Parameters
+    ----------
+    event
+        AWS Lambda event (request from CFN)
+    context
+        AWS Lambda context
+    create: function
+        Create(request) custom resource function.
+    update
+        Update custom resource function.
+    delete
+        Delete custom resource function.
+
+    """
+
+    # Set timer to expire slightly sooner so we have time to notify CFN.
+    timeout_timer = threading.Timer(
+        (context.get_remaining_time_in_millis() / 1000.00) - 0.5,
+        lambda_timeout,
+        args=[event, context],
+    )
+    timeout_timer.start()
+
     physical_resource_id = None
-
-    logger.debug("EVENT: {}".format(event))
-    # handle init failures
-    if init_failed:
-        send(event, context, "FAILED", response_data, physical_resource_id, logger, init_failed)
-        raise Exception('FAILED')
-
-    # Setup timer to catch timeouts
-    t = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5,
-                        timeout, args=[event, context, logger])
-    t.start()
-
+    response_data = {}
     try:
         # Execute custom resource handlers
-        logger.info("Received a {} Request".format(event['RequestType']))
-        if event['RequestType'] == 'Create':
-            physical_resource_id, response_data = create(event, context)
-        elif event['RequestType'] == 'Update':
-            physical_resource_id, response_data = update(event, context)
-        elif event['RequestType'] == 'Delete':
+        LOGGER.info("Received a {} Request".format(event["RequestType"]))
+        if event["RequestType"] == "Create":
+            physical_resource_id, response_data = execute_handler(event, context, create)
+        elif event["RequestType"] == "Update":
+            physical_resource_id, response_data = execute_handler(event, context, update)
+        elif event["RequestType"] == "Delete":
             delete(event, context)
 
-        # Send response back to CloudFormation
-        logger.info("Completed successfully, sending response to cfn")
-        send(event, context, "SUCCESS", response_data, physical_resource_id,
-             logger=logger)
+        send_cfn(event, context, SUCCESS, response_data, physical_resource_id=physical_resource_id)
 
-    # Catch any exceptions, log the stacktrace, send a failure back to
+    # Safety switch - Catch any exceptions, log the stacktrace, send a failure back to
     # CloudFormation and then raise an exception
-    except Exception as e:
-        logger.error(e, exc_info=True)
-        send(event, context, "FAILED", response_data, physical_resource_id, logger=logger, reason=e)
-        raise Exception('FAILED')
+    except Exception as exc:
+        LOGGER.error(exc, exc_info=True)
+        send_cfn(
+            event,
+            context,
+            FAILED,
+            reason=exc,
+        )
+        raise Exception("FAILED")
+    finally:
+        # Stop the before next lambda invocation.
+        timeout_timer.cancel()
+
+
+def execute_handler(event, context, handler):
+    """
+    Execute handlers: Create, Update and check their response.
+
+    Parameters
+    ----------
+    event
+        AWS Lambda event.
+    context
+        AWS Lambda context.
+    handler: function
+        Functions Create or Update
+    Returns
+    -------
+    tuple
+        Verified response.
+
+    """
+    response = handler(event, context)
+    if not isinstance(response, tuple) or len(response) != 2:
+        raise TypeError(f"Error during {handler.__name__} does not return tuple(PhysicalResourceId, Data).")
+    if not isinstance(response[0], str):
+        raise ValueError(f"PhysicalResourceId is not string, but {type(response[0])}.")
+    if not isinstance(response[1], dict):
+        raise TypeError(f"Data is not dictionary, but {type(response[1])}.")
+    return response
