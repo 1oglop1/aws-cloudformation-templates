@@ -150,9 +150,10 @@ def cfn_handler(event, context, create, update, delete):
         elif event["RequestType"] == "Update":
             physical_resource_id, response_data = execute_handler(event, context, update)
         elif event["RequestType"] == "Delete":
-            delete(event, context)
-            physical_resource_id = event["PhysicalResourceId"]
-                
+            physical_resource_id, response_data = execute_handler(event, context, delete, delete=True)
+        else:
+            send_cfn(event, context, FAILED, None, f"Unsupported RequestType: {event['RequestType']}")
+
         send_cfn(event, context, SUCCESS, response_data, physical_resource_id=physical_resource_id)
 
     # Safety switch - Catch any exceptions, log the stacktrace, send a failure back to
@@ -163,15 +164,16 @@ def cfn_handler(event, context, create, update, delete):
             event,
             context,
             FAILED,
-            reason=exc,
+            None,
+            reason=f"{exc.__class__.__name__}: {exc}",
         )
-        raise Exception("FAILED")
+        raise
     finally:
         # Stop the before next lambda invocation.
         timeout_timer.cancel()
 
 
-def execute_handler(event, context, handler):
+def execute_handler(event, context, handler, delete=False):
     """
     Execute handlers: Create, Update and check their response.
 
@@ -183,6 +185,8 @@ def execute_handler(event, context, handler):
         AWS Lambda context.
     handler: function
         Functions Create or Update
+    delete: bool
+        If handler is Delete - default False.
     Returns
     -------
     tuple
@@ -190,6 +194,8 @@ def execute_handler(event, context, handler):
 
     """
     response = handler(event, context)
+    if delete:
+        response = (response, {})
     if not isinstance(response, tuple) or len(response) != 2:
         raise TypeError(f"Error during {handler.__name__} does not return tuple(PhysicalResourceId, Data).")
     if not isinstance(response[0], str):
