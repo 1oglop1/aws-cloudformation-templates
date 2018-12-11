@@ -17,7 +17,7 @@
 # limitations under the License.
 ##################################################################################################
 """
-This module handles communication with AWS Cloudformation during the
+This module handles communication with AWS CloudFormation during the
 creation of lambda backed Custom Resource.
 
 Adopted from
@@ -115,7 +115,7 @@ def cfn_handler(event, context, create, update, delete):
     """
     Handle CFN events.
 
-    This function executes methods for custom resource creation and send response to cloudformation API.
+    This function executes methods for custom resource creation and send response to CloudFormation API.
 
     Parameters
     ----------
@@ -140,8 +140,6 @@ def cfn_handler(event, context, create, update, delete):
     )
     timeout_timer.start()
 
-    physical_resource_id = None
-    response_data = {}
     try:
         # Execute custom resource handlers
         LOGGER.info("Received a {} Request".format(event["RequestType"]))
@@ -150,9 +148,13 @@ def cfn_handler(event, context, create, update, delete):
         elif event["RequestType"] == "Update":
             physical_resource_id, response_data = execute_handler(event, context, update)
         elif event["RequestType"] == "Delete":
-            physical_resource_id, response_data = execute_handler(event, context, delete, delete=True)
+            delete(event, context)
+            physical_resource_id = event['PhysicalResourceId']
+            response_data = None
         else:
-            send_cfn(event, context, FAILED, None, f"Unsupported RequestType: {event['RequestType']}")
+            msg = f"Unsupported RequestType: {event['RequestType']}"
+            send_cfn(event, context, FAILED, None, msg)
+            raise TypeError(msg)
 
         send_cfn(event, context, SUCCESS, response_data, physical_resource_id=physical_resource_id)
 
@@ -173,7 +175,7 @@ def cfn_handler(event, context, create, update, delete):
         timeout_timer.cancel()
 
 
-def execute_handler(event, context, handler, delete=False):
+def execute_handler(event, context, handler):
     """
     Execute handlers: Create, Update and check their response.
 
@@ -185,8 +187,6 @@ def execute_handler(event, context, handler, delete=False):
         AWS Lambda context.
     handler: function
         Functions Create or Update
-    delete: bool
-        If handler is Delete - default False.
     Returns
     -------
     tuple
@@ -194,12 +194,10 @@ def execute_handler(event, context, handler, delete=False):
 
     """
     response = handler(event, context)
-    if delete:
-        response = (response, {})
     if not isinstance(response, tuple) or len(response) != 2:
-        raise TypeError(f"Error during {handler.__name__} does not return tuple(PhysicalResourceId, Data).")
+        raise TypeError(f"Return type of {handler.__name__} must be tuple(PhysicalResourceId, Data).")
     if not isinstance(response[0], str):
-        raise ValueError(f"PhysicalResourceId is not string, but {type(response[0])}.")
-    if not isinstance(response[1], dict):
-        raise TypeError(f"Data is not dictionary, but {type(response[1])}.")
+        raise ValueError(f"PhysicalResourceId is not string, but {handler.__name__} returned {type(response[0])}.")
+    if not isinstance(response[1], dict) or response[1] is None:
+        raise TypeError(f"Data is not dictionary, but {handler.__name__} returned {type(response[1])}.")
     return response
